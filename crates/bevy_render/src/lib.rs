@@ -80,6 +80,7 @@ use renderer::{RenderAdapter, RenderAdapterInfo, RenderDevice, RenderQueue};
 use sync_world::{
     despawn_temporary_render_entities, entity_sync_system, SyncToRenderWorld, SyncWorldPlugin,
 };
+use view::OffscreenCanvas;
 
 use crate::gpu_readback::GpuReadbackPlugin;
 use crate::{
@@ -96,7 +97,8 @@ use alloc::sync::Arc;
 use bevy_app::{App, AppLabel, Plugin, SubApp};
 use bevy_asset::{load_internal_asset, AssetApp, AssetServer, Handle};
 use bevy_ecs::{prelude::*, schedule::ScheduleLabel, system::SystemState};
-use bevy_utils::tracing::debug;
+use bevy_math::UVec2;
+use bevy_utils::tracing::{debug, info};
 use core::ops::{Deref, DerefMut};
 use std::sync::Mutex;
 
@@ -114,6 +116,8 @@ pub struct RenderPlugin {
     /// If `true`, disables asynchronous pipeline compilation.
     /// This has no effect on macOS, Wasm, iOS, or without the `multi_threaded` feature.
     pub synchronous_pipeline_compilation: bool,
+    #[cfg(target_arch = "wasm32")]
+    pub offscreen_canvas: bool,
 }
 
 /// The systems sets of the default [`App`] rendering schedule.
@@ -297,6 +301,20 @@ impl Plugin for RenderPlugin {
                     > = SystemState::new(app.world_mut());
                     let primary_window = system_state.get(app.world()).get_single().ok().cloned();
                     let settings = render_creation.clone();
+                    #[cfg(target_arch = "wasm32")]
+                    let offscreen_canvas = self.offscreen_canvas.then(|| {
+                        info!("initializing offscreen canvas");
+                        // The size will get set as needed in the render loop.
+                        OffscreenCanvas::new(
+                            web_sys::OffscreenCanvas::new(1, 1)
+                                .expect("Offscreen canvas creation failed!"),
+                        )
+                    });
+                    #[cfg(target_arch = "wasm32")]
+                    let offscreen_canvas_target = offscreen_canvas
+                        .as_ref()
+                        .map(OffscreenCanvas::surface_target);
+
                     let async_renderer = async move {
                         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
                             backends,
@@ -306,21 +324,30 @@ impl Plugin for RenderPlugin {
                         });
 
                         // SAFETY: Plugins should be set up on the main thread.
-                        let surface = primary_window.and_then(|wrapper| unsafe {
-                            let maybe_handle = wrapper.0.lock().expect(
-                                "Couldn't get the window handle in time for renderer initialization",
-                            );
-                            if let Some(wrapper) = maybe_handle.as_ref() {
-                                let handle = wrapper.get_handle();
-                                Some(
-                                    instance
-                                        .create_surface(handle)
-                                        .expect("Failed to create wgpu surface"),
-                                )
-                            } else {
-                                None
-                            }
-                        });
+                        let surface = if let Some(offscreen_canvas_target) = offscreen_canvas_target
+                        {
+                            Some(
+                                instance
+                                    .create_surface(offscreen_canvas_target)
+                                    .expect("Failed to create offscreen canvas surface"),
+                            )
+                        } else {
+                            primary_window.and_then(|wrapper| unsafe {
+                                let maybe_handle = wrapper.0.lock().expect(
+                                    "Couldn't get the window handle in time for renderer initialization",
+                                );
+                                if let Some(wrapper) = maybe_handle.as_ref() {
+                                    let handle = wrapper.get_handle();
+                                    Some(
+                                        instance
+                                            .create_surface(handle)
+                                            .expect("Failed to create wgpu surface"),
+                                    )
+                                } else {
+                                    None
+                                }
+                            })
+                        };
 
                         let request_adapter_options = wgpu::RequestAdapterOptions {
                             power_preference: settings.power_preference,
@@ -357,7 +384,13 @@ impl Plugin for RenderPlugin {
                     futures_lite::future::block_on(async_renderer);
 
                     // SAFETY: Plugins should be set up on the main thread.
-                    unsafe { initialize_render_app(app) };
+                    let render_app = unsafe { initialize_render_app(app) };
+                    #[cfg(target_arch = "wasm32")]
+                    if let Some(offscreen_canvas) = offscreen_canvas {
+                        render_app
+                            .world_mut()
+                            .insert_non_send_resource(offscreen_canvas);
+                    }
                 }
             }
         };
@@ -461,7 +494,7 @@ fn extract(main_world: &mut World, render_world: &mut World) {
 
 /// # Safety
 /// This function must be called from the main thread.
-unsafe fn initialize_render_app(app: &mut App) {
+unsafe fn initialize_render_app(app: &mut App) -> &mut SubApp {
     app.init_resource::<ScratchMainWorld>();
 
     let mut render_app = SubApp::new();
@@ -512,6 +545,7 @@ unsafe fn initialize_render_app(app: &mut App) {
     render_app.insert_resource(sender);
     app.insert_resource(receiver);
     app.insert_sub_app(RenderApp, render_app);
+    app.sub_app_mut(RenderApp)
 }
 
 /// Applies the commands from the extract schedule. This happens during

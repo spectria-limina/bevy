@@ -5,7 +5,10 @@ use bevy_derive::{Deref, DerefMut};
 use bevy_tasks::ComputeTaskPool;
 use bevy_utils::tracing::{error, info, info_span, warn};
 pub use graph_runner::*;
+use raw_window_handle::RawWindowHandle;
 pub use render_device::*;
+use wasm_bindgen::JsValue;
+use web_sys::{HtmlCanvasElement, ImageBitmapRenderingContext};
 
 use crate::{
     diagnostic::{internal::DiagnosticsRecorder, RecordDiagnostics},
@@ -13,7 +16,7 @@ use crate::{
     render_phase::TrackedRenderPass,
     render_resource::RenderPassDescriptor,
     settings::{WgpuSettings, WgpuSettingsPriority},
-    view::{ExtractedWindows, ViewTarget},
+    view::{ExtractedWindows, OffscreenCanvas, ViewTarget},
 };
 use alloc::sync::Arc;
 use bevy_ecs::{prelude::*, system::SystemState};
@@ -36,6 +39,8 @@ pub fn render_system(world: &mut World, state: &mut SystemState<Query<Entity, Wi
     let render_device = world.resource::<RenderDevice>();
     let render_queue = world.resource::<RenderQueue>();
     let render_adapter = world.resource::<RenderAdapter>();
+    #[cfg(target_arch = "wasm32")]
+    let offscreen_canvas = world.get_non_send_resource::<OffscreenCanvas>().cloned();
 
     let res = RenderGraphRunner::run(
         graph,
@@ -68,7 +73,7 @@ pub fn render_system(world: &mut World, state: &mut SystemState<Query<Entity, Wi
                 }
             }
 
-            panic!("Error running render graph: {e}");
+            panic!("Error running render graph: {e:?}");
         }
     }
 
@@ -86,11 +91,47 @@ pub fn render_system(world: &mut World, state: &mut SystemState<Query<Entity, Wi
         for window in windows.values_mut() {
             if let Some(wrapped_texture) = window.swap_chain_texture.take() {
                 if let Some(surface_texture) = wrapped_texture.try_unwrap() {
+                    // If rendering to an offscreen canvas, make sure it's the right size...
+                    if let Some(ref offscreen_canvas) = offscreen_canvas {
+                        let offscreen_canvas = offscreen_canvas.inner();
+                        offscreen_canvas.set_height(window.physical_height);
+                        offscreen_canvas.set_width(window.physical_width);
+                    }
+
                     // TODO(clean): winit docs recommends calling pre_present_notify before this.
                     // though `present()` doesn't present the frame, it schedules it to be presented
                     // by wgpu.
                     // https://docs.rs/winit/0.29.9/wasm32-unknown-unknown/winit/window/struct.Window.html#method.pre_present_notify
                     surface_texture.present();
+
+                    #[cfg(target_arch = "wasm32")]
+                    if let Some(ref offscreen_canvas) = offscreen_canvas {
+                        // We rendered to an offscreen canvas... so now copy to the actual canvas element.
+                        match offscreen_canvas.inner().transfer_to_image_bitmap() {
+                            Ok(image_bitmap) => {
+                                let RawWindowHandle::WebCanvas(canvas_handle) =
+                                    window.handle.window_handle
+                                else {
+                                    error!(
+                                        "Window's raw handle was not to a <canvas>, but {:?}",
+                                        window.handle.window_handle
+                                    );
+                                    panic!("Window's raw handle was not to a <canvas>");
+                                };
+                                // SAFETY: We never mint our own handles... right?
+                                let canvas = unsafe { HtmlCanvasElement::from(canvas_handle.as_wasm_bindgen_0_2().clone()) };
+                                match canvas.get_context("bitmaprenderer") {
+                                    Ok(Some(context)) => {
+                                        let bitmap_context = ImageBitmapRenderingContext::from(JsValue::from(context));
+                                        bitmap_context.transfer_from_image_bitmap(&image_bitmap);
+                                    }
+                                    Err(e) => error!("Error getting ImageBitmapRenderingContext for <canvas>: {e:?}"),
+                                    Ok(None) => error!("Getting ImageBitmapRenderingContext for <canvas> returned null. Did we already initialize a different context?"),
+                                }
+                            }
+                            Err(e) => error!("Error transferring rendered OffscreenCavanas data to ImageBitmap: {e:?}"),
+                        }
+                    }
                 }
             }
         }

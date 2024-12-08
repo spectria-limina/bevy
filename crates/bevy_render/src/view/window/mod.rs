@@ -5,9 +5,11 @@ use crate::{
 };
 use bevy_app::{App, Plugin};
 use bevy_ecs::{entity::EntityHashMap, prelude::*};
+use bevy_math::UVec2;
+use bevy_reflect::Reflect;
 use bevy_utils::{
     default,
-    tracing::{debug, warn},
+    tracing::{debug, info, warn},
     HashSet,
 };
 use bevy_window::{
@@ -18,7 +20,8 @@ use core::{
     ops::{Deref, DerefMut},
 };
 use wgpu::{
-    SurfaceConfiguration, SurfaceTargetUnsafe, TextureFormat, TextureUsages, TextureViewDescriptor,
+    SurfaceConfiguration, SurfaceTarget, SurfaceTargetUnsafe, TextureFormat, TextureUsages,
+    TextureViewDescriptor,
 };
 
 pub mod screenshot;
@@ -303,6 +306,24 @@ pub fn need_surface_configuration(
 // has to wait for the cpu to finish to start on the next frame.
 const DEFAULT_DESIRED_MAXIMUM_FRAME_LATENCY: u32 = 2;
 
+#[cfg(target_arch = "wasm32")]
+#[derive(Clone)]
+pub struct OffscreenCanvas(web_sys::OffscreenCanvas);
+
+impl OffscreenCanvas {
+    pub fn new(elem: web_sys::OffscreenCanvas) -> Self {
+        Self(elem)
+    }
+
+    pub fn inner(&self) -> &web_sys::OffscreenCanvas {
+        &self.0
+    }
+
+    pub fn surface_target(&self) -> SurfaceTarget<'static> {
+        SurfaceTarget::OffscreenCanvas(self.0.clone())
+    }
+}
+
 /// Creates window surfaces.
 pub fn create_surfaces(
     // By accessing a NonSend resource, we tell the scheduler to put this system on the main thread,
@@ -315,6 +336,7 @@ pub fn create_surfaces(
     render_instance: Res<RenderInstance>,
     render_adapter: Res<RenderAdapter>,
     render_device: Res<RenderDevice>,
+    #[cfg(target_arch = "wasm32")] offscreen_canvas: Option<NonSend<OffscreenCanvas>>,
 ) {
     for window in windows.windows.values() {
         let data = window_surfaces
@@ -326,13 +348,21 @@ pub fn create_surfaces(
                     raw_window_handle: window.handle.window_handle,
                 };
                 // SAFETY: The window handles in ExtractedWindows will always be valid objects to create surfaces on
-                let surface = unsafe {
-                    // NOTE: On some OSes this MUST be called from the main thread.
-                    // As of wgpu 0.15, only fallible if the given window is a HTML canvas and obtaining a WebGPU or WebGL2 context fails.
+                let surface = if let Some(ref offscreen_canvas) = offscreen_canvas {
+                    info!("Using offscreen canvas as the surface_target");
                     render_instance
-                        .create_surface_unsafe(surface_target)
-                        .expect("Failed to create wgpu surface")
+                        .create_surface(offscreen_canvas.surface_target())
+                        .expect("Failed to create offscreen canvas surface")
+                } else {
+                    unsafe {
+                        // NOTE: On some OSes this MUST be called from the main thread.
+                        // As of wgpu 0.15, only fallible if the given window is a HTML canvas and obtaining a WebGPU or WebGL2 context fails.
+                        render_instance
+                            .create_surface_unsafe(surface_target)
+                            .expect("Failed to create wgpu surface")
+                    }
                 };
+
                 let caps = surface.get_capabilities(&render_adapter);
                 let formats = caps.formats;
                 // For future HDR output support, we'll need to request a format that supports HDR,
